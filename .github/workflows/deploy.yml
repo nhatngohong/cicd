@@ -48,42 +48,67 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      - name: Upload JAR to EC2
+      - name: Upload versioned JAR to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
+          RELEASE_VERSION: ${{ github.sha }}
         run: |
+          ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" \
+            "mkdir -p /home/ec2-user/releases"
+
           scp -i ~/.ssh/deploy_key \
             "${{ steps.jar.outputs.path }}" \
-            "$EC2_USER@$EC2_HOST:/home/ec2-user/app.jar.new"
+            "$EC2_USER@$EC2_HOST:/home/ec2-user/releases/${RELEASE_VERSION}.jar"
 
       - name: Deploy and restart application
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
           EC2_USER: ${{ secrets.EC2_USER }}
+          RELEASE_VERSION: ${{ github.sha }}
         run: |
-          ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" '
-            set -e
-            mv /home/ec2-user/app.jar /home/ec2-user/app.jar.previous
-            mv /home/ec2-user/app.jar.new /home/ec2-user/app.jar
-            if sudo systemctl restart myapp; then
-              echo "Application restarted"
-            else
-              echo "Restart failed; restoring previous JAR"
-              mv /home/ec2-user/app.jar.previous /home/ec2-user/app.jar
-              sudo systemctl restart myapp || true
-              exit 1
-            fi
+          ssh -i ~/.ssh/deploy_key "$EC2_USER@$EC2_HOST" \
+            "bash -s -- '$RELEASE_VERSION'" <<'REMOTE'
+          set -e
 
-            for i in $(seq 1 20); do
-              if curl -fsS http://127.0.0.1:8080/ -o /dev/null; then
-                echo "Health check passed"
-                exit 0
-              fi
-              sleep 2
-            done
+          APP_DIR="/home/ec2-user"
+          VERSION="$1"
+          OLD_TARGET=$(readlink "$APP_DIR/app.jar")
 
-            echo "Health check failed; inspect systemd logs"
-            sudo journalctl -u myapp -n 80 --no-pager
+          if [ -z "$OLD_TARGET" ]; then
+            echo "ERROR: app.jar must be a symlink before deployment."
             exit 1
-          '
+          fi
+
+          switch_release() {
+            ln -sfn "$1" "$APP_DIR/app.jar.next"
+            mv -Tf "$APP_DIR/app.jar.next" "$APP_DIR/app.jar"
+          }
+
+          # Switch to the new release
+          switch_release "releases/$VERSION.jar"
+
+          # Restart; restore the old release if restart fails
+          if ! sudo systemctl restart myapp; then
+            echo "Restart failed; rolling back"
+            switch_release "$OLD_TARGET"
+            sudo systemctl restart myapp || true
+            exit 1
+          fi
+
+          # Health check: wait up to 40 seconds
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8080/ -o /dev/null; then
+              echo "Deployment successful: $VERSION"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          # Health check failed; restore the previous release
+          echo "Health check failed; rolling back"
+          switch_release "$OLD_TARGET"
+          sudo systemctl restart myapp || true
+          sudo journalctl -u myapp -n 80 --no-pager
+          exit 1
+          REMOTE
