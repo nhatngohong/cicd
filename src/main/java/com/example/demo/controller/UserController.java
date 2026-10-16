@@ -8,6 +8,6 @@ public class UserController {
 
     @GetMapping("/")
     public String get() {
-        return "moi ne";
+        return "test flow";
     }
 }
