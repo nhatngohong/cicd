@@ -6,6 +6,11 @@ on:
     branches:
       - main
 
+# Stage 6: Prevent concurrent production deployments.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -21,7 +26,7 @@ jobs:
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # 1. Authenticate to AWS using the credentials stored in GitHub Secrets
+      # 1. Authenticate to AWS using GitHub Secrets
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -34,7 +39,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 3. Build the image using the multi-stage Dockerfile and push it
+      # 3. Build and push Docker image
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -82,7 +87,7 @@ jobs:
 
           sudo docker pull "$IMAGE_URI"
 
-          # Stop the old JAR-based systemd service during the migration.
+          # Stop the old JAR-based systemd service during migration.
           sudo systemctl stop myapp || true
 
           rollback() {
@@ -97,7 +102,7 @@ jobs:
                 -p 127.0.0.1:8080:8080 \
                 "$OLD_IMAGE"
             else
-              # First Docker deployment: fall back to the existing JAR.
+              # First Docker deployment: try falling back to the JAR service.
               sudo systemctl start myapp || true
             fi
           }
