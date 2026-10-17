@@ -23,10 +23,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Stage 1: Checkout source code
       - name: Checkout source code
         uses: actions/checkout@v4
 
-      # 1. Authenticate to AWS using GitHub Secrets
+      # Stage 2: Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -34,12 +35,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 2. Login to Amazon ECR
+      # Stage 3: Login to Amazon ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 3. Build and push Docker image
+      # Stage 4: Build and push Docker image
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -47,7 +48,7 @@ jobs:
           push: true
           tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
-      # 4. Configure SSH to EC2
+      # Stage 5a: Configure SSH to EC2
       - name: Configure SSH
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -59,7 +60,7 @@ jobs:
           chmod 600 ~/.ssh/deploy_key
           ssh-keyscan -H "$EC2_HOST" >> ~/.ssh/known_hosts
 
-      # 5. Pull the new image and deploy the container
+      # Stage 5b: Health check and rollback
       - name: Deploy to EC2
         env:
           EC2_HOST: ${{ secrets.EC2_HOST }}
@@ -76,22 +77,61 @@ jobs:
           AWS_REGION="$2"
           REGISTRY="${IMAGE_URI%%/*}"
           CONTAINER_NAME="hello-world-api"
+          CANDIDATE_NAME="hello-world-api-candidate"
 
-          # Remember the previous Docker image for rollback.
+          # Remember the existing production image.
           OLD_IMAGE=$(sudo docker inspect \
             --format='{{.Config.Image}}' "$CONTAINER_NAME" 2>/dev/null || true)
 
-          # Authenticate EC2 to ECR and pull the new image.
+          # Authenticate to ECR and download the new image.
           aws ecr get-login-password --region "$AWS_REGION" |
             sudo docker login --username AWS --password-stdin "$REGISTRY"
 
           sudo docker pull "$IMAGE_URI"
 
-          # Stop the old JAR-based systemd service during migration.
-          sudo systemctl stop myapp || true
+          # Start candidate on port 8081.
+          # The production container on port 8080 remains untouched.
+          sudo docker rm -f "$CANDIDATE_NAME" >/dev/null 2>&1 || true
+
+          if ! sudo docker run -d \
+            --name "$CANDIDATE_NAME" \
+            -p 127.0.0.1:8081:8080 \
+            "$IMAGE_URI"; then
+            echo "Candidate failed to start. Production remains unchanged."
+            exit 1
+          fi
+
+          # Health check candidate for up to 40 seconds.
+          HEALTHY=false
+
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8081/ -o /dev/null; then
+              HEALTHY=true
+              break
+            fi
+
+            if ! sudo docker inspect \
+              --format='{{.State.Running}}' "$CANDIDATE_NAME" |
+              grep -q true; then
+              echo "Candidate container exited unexpectedly."
+              break
+            fi
+
+            sleep 2
+          done
+
+          # Candidate failed: remove only candidate.
+          if [ "$HEALTHY" != "true" ]; then
+            echo "Health check failed. Keeping production unchanged."
+            sudo docker logs --tail 80 "$CANDIDATE_NAME" || true
+            sudo docker rm -f "$CANDIDATE_NAME" || true
+            exit 1
+          fi
+
+          echo "Candidate is healthy. Promoting new version."
 
           rollback() {
-            echo "Deployment failed; rolling back"
+            echo "Production deployment failed. Rolling back."
 
             sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
@@ -102,37 +142,39 @@ jobs:
                 -p 127.0.0.1:8080:8080 \
                 "$OLD_IMAGE"
             else
-              # First Docker deployment: try falling back to the JAR service.
+              # First Docker deployment: fall back to the JAR service.
               sudo systemctl start myapp || true
             fi
           }
 
-          # Remove the previous container, if one exists.
+          # Replace production only after candidate passes health check.
+          sudo systemctl stop myapp || true
           sudo docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-          # Start the new version.
           if ! sudo docker run -d \
             --name "$CONTAINER_NAME" \
             --restart unless-stopped \
             -p 127.0.0.1:8080:8080 \
             "$IMAGE_URI"; then
             rollback
+            sudo docker rm -f "$CANDIDATE_NAME" >/dev/null 2>&1 || true
             exit 1
           fi
 
-          # Health check: wait up to 40 seconds.
+          # Verify production after promotion.
           for i in $(seq 1 20); do
             if curl -fsS http://127.0.0.1:8080/ -o /dev/null; then
-              echo "Deployment successful: $IMAGE_URI"
+              sudo docker rm -f "$CANDIDATE_NAME" >/dev/null 2>&1 || true
               sudo systemctl disable myapp || true
+              echo "Deployment successful: $IMAGE_URI"
               exit 0
             fi
             sleep 2
           done
 
-          # Health check failed: restore the previous version.
-          rollback
-          sudo journalctl -u myapp -n 80 --no-pager || true
+          # Production health check failed: restore the previous image.
           sudo docker logs --tail 80 "$CONTAINER_NAME" || true
+          rollback
+          sudo docker rm -f "$CANDIDATE_NAME" >/dev/null 2>&1 || true
           exit 1
           REMOTE
